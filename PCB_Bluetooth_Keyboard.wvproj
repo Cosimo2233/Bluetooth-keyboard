@@ -43,7 +43,8 @@
 					"${project}/Ld",
 					"${project}/RVMSIS",
 					"${project}/StdPeriphDriver",
-					"${project}/Startup"
+					"${project}/Startup",
+					"${project}/tests"
 				],
 				"riscvTargetProcessor": {
 					"architecture": "rv32i",
@@ -363,7 +364,8 @@
 					"${project}/Ld",
 					"${project}/RVMSIS",
 					"${project}/StdPeriphDriver",
-					"${project}/Startup"
+					"${project}/Startup",
+					"${project}/tests"
 				],
 				"riscvTargetProcessor": {
 					"architecture": "rv32i",

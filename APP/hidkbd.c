@@ -22,6 +22,7 @@
 #include "Touch.h"
 #include "nfc_btssp_t2t.h"
 #include "glue.h"
+#include "keyboard_transport.h"
 
 /*********************************************************************
  * MACROS
@@ -231,6 +232,15 @@ static CONST uint8_t keyboard_val_table[48] = {
  * LOCAL FUNCTIONS
  */
 
+static void keyboardResetInput(void)
+{
+    modifier_key_flag = fn_key_flag = 0;
+    key_index = pre_key_index = 2;
+    tmos_memset(key_buf, 0, sizeof(key_buf));
+    touch_ClearKey();
+    tmos_stop_task(hidEmuTaskId, START_SPECIAL_KEY_TIMEOUT_EVT);
+    tmos_clear_event(hidEmuTaskId, START_SPECIAL_KEY_TIMEOUT_EVT);
+}
 static void    hidEmu_ProcessTMOSMsg(tmos_event_hdr_t *pMsg);
 static uint8_t hidEmuRcvReport(uint8_t len, uint8_t *pData);
 static uint8_t hidEmuRptCB(uint8_t id, uint8_t type, uint16_t uuid,
@@ -356,8 +366,6 @@ void HidEmu_Init()
  */
 uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 {
-    static uint8_t send_char = 4;
-
     if(events & SYS_EVENT_MSG)
     {
         uint8_t *pMsg;
@@ -376,6 +384,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
     if(events & START_DEVICE_EVT)
     {
+        tmos_start_task(hidEmuTaskId, START_TOUCH_KEY_PROCESS_EVT, MS1_TO_SYSTEM_TIME(10));
         return (events ^ START_DEVICE_EVT);
     }
 
@@ -403,6 +412,16 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
 
     if(events & START_SPECIAL_KEY_TIMEOUT_EVT) //Modifier Keys timeout report
     {
+        if(KeyboardTransport_Update())
+        {
+            keyboardResetInput();
+            return (events ^ START_SPECIAL_KEY_TIMEOUT_EVT);
+        }
+        if(!KeyboardTransport_HasRoom())
+        {
+            tmos_start_task(hidEmuTaskId, START_SPECIAL_KEY_TIMEOUT_EVT, MS1_TO_SYSTEM_TIME(10));
+            return (events ^ START_SPECIAL_KEY_TIMEOUT_EVT);
+        }
         PRINT("special key timeout report\n");
         if(fn_key_flag)
         {
@@ -414,15 +433,13 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         //     PRINT("%x ", key_buf[i]);
         // }
         // PRINT("\n");
-        HidDev_Report(HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT, //Press Report
-                      HID_KEYBOARD_IN_RPT_LEN, key_buf);
+        KeyboardTransport_Report(key_buf);
 
         modifier_key_flag = 0;
         fn_key_flag = 0;
         key_buf[0] = 0;
         key_buf[1] = 0;
-        HidDev_Report(HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT, //Release Report
-                      HID_KEYBOARD_IN_RPT_LEN, key_buf);
+        KeyboardTransport_Report(key_buf);
 
         return (events ^ START_SPECIAL_KEY_TIMEOUT_EVT);
     }
@@ -431,11 +448,24 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
     {
         uint8_t key_val = 0x00;
         uint8_t i;
+        if(KeyboardTransport_Update()) keyboardResetInput();
+        if(KeyboardTransport_Active() == KEYBOARD_WAITING)
+        {
+            keyboardResetInput();
+            tmos_start_task(hidEmuTaskId, START_TOUCH_KEY_PROCESS_EVT, MS1_TO_SYSTEM_TIME(10));
+            return (events ^ START_TOUCH_KEY_PROCESS_EVT);
+        }
+        if(!KeyboardTransport_HasRoom())
+        {
+            tmos_start_task(hidEmuTaskId, START_TOUCH_KEY_PROCESS_EVT, MS1_TO_SYSTEM_TIME(10));
+            return (events ^ START_TOUCH_KEY_PROCESS_EVT);
+        }
 
-        while(1)
+        /* Preserve press/release ordering even for quick taps. */
+        for(uint8_t processed = 0; processed < 1; ++processed)
         {
             key_val = touch_GetKey();
-            if (key_val != 0x00)
+            if (key_val != 0x00 && (key_val / 3) < KEY_COUNT)
             {
                 /* The key value of each key is 3*n+s.
                  * n: key number, starting from 1.
@@ -453,12 +483,12 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                         case 36:                                                //CTRL
                         case 38:                                                //WIN
                         case 39:                                                //ALT
-                            key_buf[0] += keyboard_val_table[key_val];
+                            key_buf[0] |= keyboard_val_table[key_val];
                             modifier_key_flag = 1;
                             tmos_start_task(hidEmuTaskId, START_SPECIAL_KEY_TIMEOUT_EVT, DEFAULT_SPECIAL_KEY_TIMEOUT); //Key combination timeout task
                             break;
                         case 43:                                                //Fn
-                            key_buf[1] = keyboard_val_table[key_val];
+                            key_buf[1] = 0; /* HID reserved byte; Fn remains local. */
                             fn_key_flag = 1;
                             tmos_start_task(hidEmuTaskId, START_SPECIAL_KEY_TIMEOUT_EVT, DEFAULT_SPECIAL_KEY_TIMEOUT); //Key combination timeout task
                             break;
@@ -468,8 +498,10 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                                 // Add Fn key function
                             }
 
-                            key_buf[key_index] = keyboard_val_table[key_val];
-                            ++key_index;
+                            for(i = 2; i < key_index; ++i)
+                                if(key_buf[i] == keyboard_val_table[key_val]) break;
+                            if(i == key_index && key_index < sizeof(key_buf))
+                                key_buf[key_index++] = keyboard_val_table[key_val];
                             break;
                     }
                 }
@@ -501,7 +533,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             }
         }
 
-        if ((key_index != 2) || ((pre_key_index != 2) && (modifier_key_flag == 0) && (fn_key_flag == 0)))
+        if (key_val != 0 && ((key_index != 2) || ((pre_key_index != 2) && (modifier_key_flag == 0) && (fn_key_flag == 0))))
         {
             PRINT("report buf:");
             for(uint8_t i=0; i<8; ++i)
@@ -509,7 +541,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
                 PRINT("%x ", key_buf[i]);
             }
             PRINT("\n");
-            HidDev_Report(HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT, HID_KEYBOARD_IN_RPT_LEN, key_buf);
+            KeyboardTransport_Report(key_buf);
             pre_key_index = key_index;
         }
 
@@ -522,7 +554,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             tmos_memset(key_buf, 0, HID_KEYBOARD_IN_RPT_LEN);
             tmos_stop_task(hidEmuTaskId, START_SPECIAL_KEY_TIMEOUT_EVT);
             tmos_clear_event(hidEmuTaskId, START_SPECIAL_KEY_TIMEOUT_EVT);
-            HidDev_Report(HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT, HID_KEYBOARD_IN_RPT_LEN, key_buf);
+            KeyboardTransport_Report(key_buf);
         }
 
         tmos_start_task(hidEmuTaskId, START_TOUCH_KEY_PROCESS_EVT, MS1_TO_SYSTEM_TIME(10));
@@ -659,8 +691,7 @@ static void hidEmuStateCB(gapRole_States_t newState, gapRoleEvent_t *pEvent)
             else if(pEvent->gap.opcode == GAP_LINK_TERMINATED_EVENT)
             {
                 bleConnectState = 0;
-                tmos_stop_task(hidEmuTaskId, START_TOUCH_KEY_PROCESS_EVT);
-                tmos_clear_event(hidEmuTaskId, START_TOUCH_KEY_PROCESS_EVT);
+                KeyboardTransport_SetBleReady(0);
                 PRINT("Disconnected.. Reason:%x\n", pEvent->linkTerminate.reason);
             }
             else if(pEvent->gap.opcode == GAP_LINK_ESTABLISHED_EVENT)
@@ -750,9 +781,10 @@ static uint8_t hidEmuRptCB(uint8_t id, uint8_t type, uint16_t uuid,
         status = Hid_GetParameter(id, type, uuid, pLen, pData);
     }
     // notifications enabled
-    else if(oper == HID_DEV_OPER_ENABLE)
+    else if((oper == HID_DEV_OPER_ENABLE || oper == HID_DEV_OPER_DISABLE) &&
+            id == HID_RPT_ID_KEY_IN && type == HID_REPORT_TYPE_INPUT)
     {
-        tmos_start_task(hidEmuTaskId, START_TOUCH_KEY_PROCESS_EVT, MS1_TO_SYSTEM_TIME(10));
+        KeyboardTransport_SetBleReady(oper == HID_DEV_OPER_ENABLE && bleConnectState);
     }
     return status;
 }

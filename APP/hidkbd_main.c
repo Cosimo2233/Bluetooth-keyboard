@@ -17,6 +17,8 @@
 #include "hiddev.h"
 #include "hidkbd.h"
 #include "app_tmos.h"
+#include "usb_keyboard.h"
+#include "keyboard_transport.h"
 
 /*********************************************************************
  * GLOBAL TYPEDEFS
@@ -41,6 +43,7 @@ void Main_Circulation()
     while(1)
     {
         TMOS_SystemProcess();
+        KeyboardTransport_Service();
     }
 }
 
@@ -75,6 +78,7 @@ int main(void)
     HidDev_Init();
     HidEmu_Init();
     touch_on_TMOS_init();
+    UsbKeyboard_Init();
     Main_Circulation();
 }
 

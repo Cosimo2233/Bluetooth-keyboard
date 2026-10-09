@@ -291,7 +291,7 @@
             </toolChain>
           </folderInfo>
           <sourceEntries>
-            <entry excluding="Ld|RVMSIS|StdPeriphDriver|Startup" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name=""/>
+            <entry excluding="Ld|RVMSIS|StdPeriphDriver|Startup|tests" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name=""/>
           </sourceEntries>
         </configuration>
       </storageModule>
@@ -580,7 +580,7 @@
             </toolChain>
           </folderInfo>
           <sourceEntries>
-            <entry excluding="Ld|RVMSIS|StdPeriphDriver|Startup" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name=""/>
+            <entry excluding="Ld|RVMSIS|StdPeriphDriver|Startup|tests" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name=""/>
           </sourceEntries>
         </configuration>
       </storageModule>

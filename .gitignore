@@ -1,6 +1,7 @@
 # MRS build outputs
 /obj/
 /dbg/
+/tests/*.exe
 
 # MRS local snapshots and generated workspace copies
 /.mrs/*.snapshot
