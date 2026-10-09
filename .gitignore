@@ -1,0 +1,12 @@
+# MRS build outputs
+/obj/
+/dbg/
+
+# MRS local snapshots and generated workspace copies
+/.mrs/*.snapshot
+/.mrs/*-[0-9]*.mrs-workspace
+/.mrs/*.bak
+
+# Local temporary files
+*.tmp
+*.log
