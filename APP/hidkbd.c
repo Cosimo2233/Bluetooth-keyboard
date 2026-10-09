@@ -447,6 +447,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
     if(events & START_TOUCH_KEY_PROCESS_EVT)
     {
         uint8_t key_val = 0x00;
+        uint8_t key_event = 0x00;
         uint8_t i;
         if(KeyboardTransport_Update()) keyboardResetInput();
         if(KeyboardTransport_Active() == KEYBOARD_WAITING)
@@ -464,7 +465,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
         /* Preserve press/release ordering even for quick taps. */
         for(uint8_t processed = 0; processed < 1; ++processed)
         {
-            key_val = touch_GetKey();
+            key_event = key_val = touch_GetKey();
             if (key_val != 0x00 && (key_val / 3) < KEY_COUNT)
             {
                 /* The key value of each key is 3*n+s.
@@ -533,7 +534,7 @@ uint16_t HidEmu_ProcessEvent(uint8_t task_id, uint16_t events)
             }
         }
 
-        if (key_val != 0 && ((key_index != 2) || ((pre_key_index != 2) && (modifier_key_flag == 0) && (fn_key_flag == 0))))
+        if (key_event != 0 && ((key_index != 2) || ((pre_key_index != 2) && (modifier_key_flag == 0) && (fn_key_flag == 0))))
         {
             PRINT("report buf:");
             for(uint8_t i=0; i<8; ++i)

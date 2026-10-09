@@ -90,4 +90,7 @@ extern uint8_t mock_R8_USB2_MIS_ST;
 #undef R8_USBHS_PLL_CTRL
 extern uint8_t mock_R8_USBHS_PLL_CTRL;
 #define R8_USBHS_PLL_CTRL mock_R8_USBHS_PLL_CTRL
+#undef R8_USB2_WAKE_CTRL
+extern uint8_t mock_R8_USB2_WAKE_CTRL;
+#define R8_USB2_WAKE_CTRL mock_R8_USB2_WAKE_CTRL
 #endif

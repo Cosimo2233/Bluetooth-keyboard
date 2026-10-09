@@ -15,10 +15,10 @@ static const uint8_t report_descriptor[] = {
 /* Development VID/PID from WCH's CompoundDev example. */
 static const uint8_t device_descriptor[] = {
     18, 1, 0x10, 0x01, 0, 0, 0, 64,
-    0x3d, 0x41, 0x07, 0x21, 0x01, 0x01, 1, 2, 0, 1
+    0x3d, 0x41, 0x07, 0x21, 0x02, 0x01, 1, 2, 0, 1
 };
 static const uint8_t config_descriptor[] = {
-    9, 2, 34, 0, 1, 1, 0, 0x80, 50,
+    9, 2, 34, 0, 1, 1, 0, 0xa0, 50,
     9, 4, 0, 0, 1, 3, 1, 1, 0,
     9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof(report_descriptor), 0,
     7, 5, 0x81, 3, 8, 0, 10
@@ -36,7 +36,11 @@ static __attribute__((aligned(4))) uint8_t ep0_buffer[64];
 /* USBHS has separate RX/TX DMA addresses. EP1 is IN only. */
 static __attribute__((aligned(4))) uint8_t ep1_buffer[64];
 static volatile uint8_t configuration;
-static volatile uint8_t suspended;
+static volatile uint8_t remote_wakeup;
+static volatile uint8_t wake_requested;
+static volatile uint8_t wake_sent;
+static volatile uint8_t suspend_observed;
+static uint32_t suspend_time;
 static volatile uint32_t session;
 static volatile uint8_t idle_rate;
 static uint8_t protocol = 1;
@@ -167,9 +171,18 @@ static void setup_request(void)
        ((type == 0x80 && index == 0) || (configuration && type == 0x81 && index == 0) ||
         (type == 0x82 && (index == 0 || index == 0x80 || (configuration && index == 0x81)))))
     {
-        reply[0] = (index == 0x81 && (R8_U2EP1_TX_CTRL & USBHS_UEP_T_RES_MASK) == USBHS_UEP_T_RES_STALL);
+        reply[0] = type == 0x80 ? (remote_wakeup ? 2 : 0) :
+                   (type == 0x82 && index == 0x81 &&
+                    (R8_U2EP1_TX_CTRL & USBHS_UEP_T_RES_MASK) == USBHS_UEP_T_RES_STALL);
         reply[1] = 0;
         control_read(reply, 2, length);
+        return;
+    }
+    if(configuration && type == 0x00 && index == 0 &&
+       value == USB_REQ_FEAT_REMOTE_WAKEUP && length == 0 &&
+       (request == USB_CLEAR_FEATURE || request == USB_SET_FEATURE))
+    {
+        control_status();
         return;
     }
     if(configuration && type == 0x02 && index == 0x81 && value == 0 && length == 0 &&
@@ -242,9 +255,15 @@ static void control_in_complete(void)
         else if(request_type == 0x00 && request == USB_SET_CONFIGURATION)
         {
             configuration = value;
-            suspended = 0;
+            remote_wakeup = wake_requested = wake_sent = suspend_observed = 0;
             ++session;
             reset_endpoint();
+        }
+        else if(request_type == 0x00 &&
+                (request == USB_SET_FEATURE || request == USB_CLEAR_FEATURE))
+        {
+            remote_wakeup = request == USB_SET_FEATURE;
+            if(!remote_wakeup) wake_requested = 0;
         }
         else if((request_type == 0x01 && request == USB_SET_INTERFACE) ||
                 (request_type == 0x02 && request == USB_CLEAR_FEATURE))
@@ -268,7 +287,7 @@ void USB2_DEVICE_IRQHandler(void)
     if(flags & USBHS_UDIF_BUS_RST)
     {
         configuration = 0;
-        suspended = 0;
+        remote_wakeup = wake_requested = wake_sent = suspend_observed = 0;
         idle_rate = 0;
         protocol = 1;
         leds = 0;
@@ -324,15 +343,16 @@ void USB2_DEVICE_IRQHandler(void)
             R8_U2EP0_RX_CTRL &= ~USBHS_UEP_R_DONE;
         }
     }
-    if(flags & (USBHS_UDIF_SUSPEND | USBHS_UDIF_BUS_SLEEP | USBHS_UDIF_LINK_RDY))
+    /* LINK_RDY/suspend are not a bus reset. Keep the host's configuration
+     * and endpoint toggle across idle/resume; the host need not enumerate
+     * again. Poll the live state so a missed resume IRQ cannot latch sleep. */
+    if((flags & USBHS_UDIF_LINK_RDY) && configuration &&
+       !(R8_USB2_MIS_ST & (USBHS_UDMS_READY | USBHS_UDMS_SUSPEND | USBHS_UDMS_SLEEP)))
     {
-        uint8_t state = R8_USB2_MIS_ST;
-        suspended = (state & (USBHS_UDMS_SUSPEND | USBHS_UDMS_SLEEP)) != 0;
-        if((flags & USBHS_UDIF_LINK_RDY) && !(state & USBHS_UDMS_READY))
-        {
-            configuration = 0;
-            ++session;
-        }
+        configuration = 0;
+        remote_wakeup = wake_requested = wake_sent = suspend_observed = 0;
+        ++session;
+        reset_endpoint();
     }
     R8_USB2_INT_FG = flags & ~USBHS_UDIF_TRANSFER;
 }
@@ -341,7 +361,7 @@ void UsbKeyboard_Init(void)
 {
     PFIC_DisableIRQ(USB2_DEVICE_IRQn);
     configuration = 0;
-    suspended = 0;
+    remote_wakeup = wake_requested = wake_sent = suspend_observed = 0;
     idle_rate = 0;
     protocol = 1;
     session = 0;
@@ -379,8 +399,19 @@ void UsbKeyboard_Init(void)
 uint8_t UsbKeyboard_Ready(void)
 {
     uint8_t state = R8_USB2_MIS_ST;
-    return configuration == 1 && !suspended && (state & USBHS_UDMS_READY) &&
+    return configuration == 1 && (state & USBHS_UDMS_READY) &&
            !(state & (USBHS_UDMS_SUSPEND | USBHS_UDMS_SLEEP));
+}
+uint8_t UsbKeyboard_Connected(void)
+{
+    /* An enumerated sleeping host still owns the keyboard. READY can drop
+     * during suspend, so it must not force a route change or lose key taps. */
+    return configuration == 1 &&
+           (R8_USB2_MIS_ST & (USBHS_UDMS_READY | USBHS_UDMS_SUSPEND | USBHS_UDMS_SLEEP));
+}
+void UsbKeyboard_RequestWakeup(void)
+{
+    if(UsbKeyboard_Connected() && !UsbKeyboard_Ready()) wake_requested = 1;
 }
 uint32_t UsbKeyboard_Session(void) {return session;}
 
@@ -401,9 +432,42 @@ uint8_t UsbKeyboard_Send(const uint8_t report[8])
     return accepted;
 }
 
-void UsbKeyboard_Poll(uint32_t now)
+void UsbKeyboard_Poll(uint32_t now, uint8_t allow_idle_report)
 {
+    PFIC_DisableIRQ(USB2_DEVICE_IRQn);
+    /* A confirmed inactive link needs fresh enumeration. A charger must
+     * not inherit the PC's configuration on a battery-powered board. */
+    if(configuration &&
+       !(R8_USB2_MIS_ST & (USBHS_UDMS_READY | USBHS_UDMS_SUSPEND | USBHS_UDMS_SLEEP)))
+    {
+        configuration = 0;
+        remote_wakeup = 0;
+        ++session;
+        reset_endpoint();
+    }
+    if(UsbKeyboard_Connected() &&
+       (R8_USB2_MIS_ST & (USBHS_UDMS_SUSPEND | USBHS_UDMS_SLEEP)))
+    {
+        if(!suspend_observed)
+        {
+            suspend_observed = 1;
+            suspend_time = now;
+        }
+        /* USB 2.0: observe at least 5 ms of idle before remote wakeup.
+         * CH585 times and clears the resume signal in hardware (WCH SDK).
+         * Send only once per suspend, and only when enabled by the host. */
+        if(remote_wakeup && wake_requested && !wake_sent &&
+           (uint32_t)(now - suspend_time) >= MS1_TO_SYSTEM_TIME(5))
+        {
+            R8_USB2_WAKE_CTRL |= USBHS_UD_UD_REMOTE_WKUP;
+            wake_sent = 1;
+        }
+    }
+    else
+        suspend_observed = wake_requested = wake_sent = 0;
+    PFIC_EnableIRQ(USB2_DEVICE_IRQn);
     if(!UsbKeyboard_Ready()) {last_report_time = now; return;}
+    if(!allow_idle_report) {last_report_time = now; return;}
     if(idle_rate && (uint32_t)(now - last_report_time) >= MS1_TO_SYSTEM_TIME((uint32_t)idle_rate * 4))
     {
         if(UsbKeyboard_Send(current_report)) last_report_time = now;

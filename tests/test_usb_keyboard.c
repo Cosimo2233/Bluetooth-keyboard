@@ -28,6 +28,7 @@ uint8_t mock_R8_USB2_INT_FG;
 uint8_t mock_R8_USB2_INT_ST;
 uint8_t mock_R8_USB2_MIS_ST;
 uint8_t mock_R8_USBHS_PLL_CTRL;
+uint8_t mock_R8_USB2_WAKE_CTRL;
 static uint32_t clock_now;
 static uint8_t ble_busy;
 static uint8_t ble_reports[64][8];
@@ -110,6 +111,7 @@ static void test_enumeration(void)
     setup(0x80, USB_GET_DESCRIPTOR, 0x0200, 0, 255);
     assert(R16_U2EP0_T_LEN == 34 && ep0_buffer[2] == 34 && ep0_buffer[4] == 1);
     assert(ep0_buffer[29] == 0x81 && ep0_buffer[31] == 8);
+    assert(ep0_buffer[7] & 0x20); /* Remote wakeup capability. */
     token(UIS_TOKEN_IN, 0); token(UIS_TOKEN_OUT, 0);
     setup(0x81, USB_GET_DESCRIPTOR, 0x2200, 0, 255);
     assert(R16_U2EP0_T_LEN == sizeof(report_descriptor));
@@ -199,15 +201,18 @@ static void test_routing(void)
 
     R8_USB2_MIS_ST = USBHS_UDMS_READY | USBHS_UDMS_SUSPEND;
     R8_USB2_INT_FG = USBHS_UDIF_SUSPEND; USB2_DEVICE_IRQHandler();
-    assert(KeyboardTransport_Update() && KeyboardTransport_Active() == KEYBOARD_BLE);
+    assert(!UsbKeyboard_Ready() && UsbKeyboard_Connected());
+    assert(!KeyboardTransport_Update() && KeyboardTransport_Active() == KEYBOARD_USB);
     KeyboardTransport_Service();
+    saved = ble_count;
     KeyboardTransport_Report(press); KeyboardTransport_Service();
-    assert(ble_reports[ble_count - 1][2] == 4);
+    assert(ble_count == saved && count == 1); /* Keep the tap for the USB host. */
     R8_USB2_MIS_ST = USBHS_UDMS_READY;
-    R8_USB2_INT_FG = USBHS_UDIF_SUSPEND; USB2_DEVICE_IRQHandler();
-    assert(KeyboardTransport_Update() && KeyboardTransport_Active() == KEYBOARD_USB);
+    /* Resume must work even without a second suspend interrupt. */
+    assert(UsbKeyboard_Ready());
+    assert(!KeyboardTransport_Update() && KeyboardTransport_Active() == KEYBOARD_USB);
     KeyboardTransport_Service(); token(UIS_TOKEN_IN | 1, 0);
-    assert(ble_reports[ble_count - 1][2] == 0);
+    assert(ep1_buffer[2] == 4 && count == 0);
 
     for(unsigned i = 0; i < REPORT_QUEUE_SIZE - 1; ++i) KeyboardTransport_Report(press);
     assert(!KeyboardTransport_HasRoom());
@@ -249,11 +254,104 @@ static void test_usbhs_link(void)
     assert(UsbKeyboard_Ready());
 }
 
+static void set_remote_wakeup(uint8_t enabled)
+{
+    setup(0, enabled ? USB_SET_FEATURE : USB_CLEAR_FEATURE,
+          USB_REQ_FEAT_REMOTE_WAKEUP, 0, 0);
+    token(UIS_TOKEN_IN, 0);
+    setup(0x80, USB_GET_STATUS, 0, 0, 2);
+    assert(ep0_buffer[0] == (enabled ? 2 : 0) && ep0_buffer[1] == 0);
+    token(UIS_TOKEN_IN, 0); token(UIS_TOKEN_OUT, 0);
+}
+
+static void test_idle_wakeup(void)
+{
+    const uint8_t press[8] = {0, 0, 4};
+    uint32_t old_session;
+    configure();
+    set_remote_wakeup(1);
+    KeyboardTransport_Update();
+    KeyboardTransport_Service(); token(UIS_TOKEN_IN | 1, 0);
+    old_session = UsbKeyboard_Session();
+    R8_USB2_WAKE_CTRL = 0;
+    clock_now = MS1_TO_SYSTEM_TIME(60000);
+    /* READY temporarily low during sleep + LINK_RDY used to erase config. */
+    R8_USB2_MIS_ST = USBHS_UDMS_SUSPEND;
+    R8_USB2_INT_FG = USBHS_UDIF_SUSPEND | USBHS_UDIF_LINK_RDY;
+    USB2_DEVICE_IRQHandler();
+    assert(configuration == 1 && UsbKeyboard_Session() == old_session);
+    assert(!KeyboardTransport_Update() && KeyboardTransport_Active() == KEYBOARD_USB);
+    KeyboardTransport_Service();
+    assert(!R8_USB2_WAKE_CTRL); /* Idle alone does not wake. */
+    KeyboardTransport_Report(press);
+    KeyboardTransport_Report(released); /* Complete quick tap while suspended. */
+    clock_now += MS1_TO_SYSTEM_TIME(4);
+    KeyboardTransport_Service();
+    assert(!R8_USB2_WAKE_CTRL && count == 2);
+    ++clock_now;
+    ++clock_now;
+    KeyboardTransport_Service();
+    assert(R8_USB2_WAKE_CTRL & USBHS_UD_UD_REMOTE_WKUP);
+    R8_USB2_WAKE_CTRL = 0; /* Hardware clears the pulse. */
+    clock_now += MS1_TO_SYSTEM_TIME(100);
+    KeyboardTransport_Service();
+    assert(!R8_USB2_WAKE_CTRL && count == 2); /* One pulse per suspend. */
+    R8_USB2_MIS_ST = USBHS_UDMS_READY; /* No resume IRQ. */
+    assert(!KeyboardTransport_Update());
+    KeyboardTransport_Service();
+    assert(ep1_buffer[2] == 4 && count == 1);
+    token(UIS_TOKEN_IN | 1, 0);
+    KeyboardTransport_Service();
+    assert(ep1_buffer[2] == 0 && count == 0);
+    token(UIS_TOKEN_IN | 1, 0);
+
+    /* Disabled wakeup: retain reports but never signal the host. */
+    set_remote_wakeup(0);
+    R8_USB2_MIS_ST = USBHS_UDMS_READY | USBHS_UDMS_SLEEP;
+    KeyboardTransport_Service();
+    KeyboardTransport_Report(press);
+    clock_now += MS1_TO_SYSTEM_TIME(100);
+    KeyboardTransport_Service();
+    assert(!R8_USB2_WAKE_CTRL && count == 1);
+    R8_USB2_INT_FG = USBHS_UDIF_BUS_RST; USB2_DEVICE_IRQHandler();
+    assert(!remote_wakeup && !wake_requested && !UsbKeyboard_Connected());
+    KeyboardTransport_Update();
+}
+
+static void test_charger(void)
+{
+    /* Supply/PHY status without SET_CONFIGURATION is never a USB keyboard. */
+    UsbKeyboard_Init();
+    R8_USB2_MIS_ST = USBHS_UDMS_READY;
+    assert(!UsbKeyboard_Connected());
+    KeyboardTransport_SetBleReady(1);
+    KeyboardTransport_Update();
+    assert(KeyboardTransport_Active() == KEYBOARD_BLE);
+    configure();
+    KeyboardTransport_Update();
+    assert(KeyboardTransport_Active() == KEYBOARD_USB);
+    R8_USB2_MIS_ST = 0; /* Actual disconnect with battery power retained. */
+    R8_USB2_INT_FG = USBHS_UDIF_LINK_RDY; USB2_DEVICE_IRQHandler();
+    assert(configuration == 0);
+    R8_USB2_MIS_ST = USBHS_UDMS_READY;
+    KeyboardTransport_Update();
+    assert(KeyboardTransport_Active() == KEYBOARD_BLE); /* Charger, no enum. */
+    configure();
+    R8_USB2_MIS_ST = 0; /* Missing disconnect IRQ is caught by main polling. */
+    UsbKeyboard_Poll(clock_now, 0);
+    assert(configuration == 0);
+    KeyboardTransport_SetBleReady(0);
+    KeyboardTransport_Update();
+    assert(KeyboardTransport_Active() == KEYBOARD_WAITING);
+}
+
 int main(void)
 {
     test_enumeration();
     test_routing();
     test_usbhs_link();
-    puts("PASS: USBHS PB12/PB13 init, enumeration, HID control, ordered reports, USB priority, reset, fallback, queue pressure, link/sleep");
+    test_idle_wakeup();
+    test_charger();
+    puts("PASS: USBHS init, enumeration, HID controls, ordered reports, USB priority, reset, queue pressure, idle/resume, remote wakeup, charger");
     return 0;
 }

@@ -23,7 +23,7 @@ void KeyboardTransport_SetBleReady(uint8_t ready)
 
 uint8_t KeyboardTransport_Update(void)
 {
-    uint8_t next = UsbKeyboard_Ready() ? KEYBOARD_USB :
+    uint8_t next = UsbKeyboard_Connected() ? KEYBOARD_USB :
                    (ble_ready ? KEYBOARD_BLE : KEYBOARD_WAITING);
     uint32_t next_session = UsbKeyboard_Session();
     uint8_t changed = next != active || (next == KEYBOARD_USB && next_session != usb_session) ||
@@ -53,22 +53,30 @@ void KeyboardTransport_Report(const uint8_t report[8])
     memcpy(reports[(head + count) % REPORT_QUEUE_SIZE], report, 8);
     reports[(head + count) % REPORT_QUEUE_SIZE][1] = 0;
     ++count;
+    /* All-up/idle reports must not wake a sleeping computer by themselves. */
+    if(active == KEYBOARD_USB)
+    {
+        for(uint8_t i = 0; i < 8; ++i)
+            if(i != 1 && report[i]) {UsbKeyboard_RequestWakeup(); break;}
+    }
 }
 
 void KeyboardTransport_Service(void)
 {
     uint8_t sent = 0;
+    /* Also service wakeup when reports are queued awaiting host resume. */
+    UsbKeyboard_Poll(TMOS_GetSystemClock(), count == 0);
     if(ble_release_pending && ble_ready)
     {
         if(HidDev_Report(HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT, 8, (uint8_t *)released) == SUCCESS)
             ble_release_pending = 0;
         else if(active == KEYBOARD_BLE) return;
     }
-    if(!count) {UsbKeyboard_Poll(TMOS_GetSystemClock()); return;}
+    if(!count) return;
     /* Re-check readiness before sending: an interrupt may have reset USB. */
     if(active == KEYBOARD_USB && UsbKeyboard_Ready() && UsbKeyboard_Session() == usb_session)
         sent = UsbKeyboard_Send(reports[head]);
-    else if(active == KEYBOARD_BLE && ble_ready && !UsbKeyboard_Ready())
+    else if(active == KEYBOARD_BLE && ble_ready && !UsbKeyboard_Connected())
         sent = HidDev_Report(HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT, 8, reports[head]) == SUCCESS;
     if(sent) {head = (head + 1) % REPORT_QUEUE_SIZE; --count;}
 }
